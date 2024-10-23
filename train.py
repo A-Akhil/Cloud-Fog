@@ -36,8 +36,24 @@ def train(config):
     train_dataset, validation_dataset = torch.utils.data.random_split(dataset, [train_size, validation_size])
     print('train dataset:', len(train_dataset))
     print('validation dataset:', len(validation_dataset))
-    training_data_loader = DataLoader(dataset=train_dataset, num_workers=config.threads, batch_size=config.batchsize, shuffle=True)
-    validation_data_loader = DataLoader(dataset=validation_dataset, num_workers=config.threads, batch_size=config.validation_batchsize, shuffle=False)
+    
+    training_data_loader = DataLoader(
+        dataset=train_dataset,
+        num_workers=config.threads,
+        batch_size=config.batchsize,
+        shuffle=True,
+        pin_memory=True,  # Added pin_memory for faster transfers
+        persistent_workers=True  # Reduces DataLoader memory overhead
+    )
+    
+    validation_data_loader = DataLoader(
+        dataset=validation_dataset,
+        num_workers=config.threads,
+        batch_size=config.validation_batchsize,
+        shuffle=False,
+        pin_memory=True,
+        persistent_workers=True
+    )
     
     ### MODELS LOAD ###
     print('===> Loading models')
@@ -56,7 +72,7 @@ def train(config):
         dis.load_state_dict(param)
         print('load {} as pretrained model'.format(config.dis_init))
 
-    # setup optimizer
+    # Setup optimizer
     opt_gen = optim.Adam(gen.parameters(), lr=config.lr, betas=(config.beta1, 0.999), weight_decay=0.00001)
     opt_dis = optim.Adam(dis.parameters(), lr=config.lr, betas=(config.beta1, 0.999), weight_decay=0.00001)
 
@@ -85,16 +101,23 @@ def train(config):
     validationreport = TestReport(log_dir=config.out_dir)
 
     print('===> begin')
-    start_time=time.time()
-    # main
+    start_time = time.time()
+
+    # Accumulation step to reduce memory usage
+    accumulation_steps = 4  # Update after every 4 iterations
+
     for epoch in range(1, config.epoch + 1):
         epoch_start_time = time.time()
+        opt_gen.zero_grad()  # Zero gradients for generator
+
         for iteration, batch in enumerate(training_data_loader, 1):
             real_a_cpu, real_b_cpu, M_cpu = batch[0], batch[1], batch[2]
             real_a.data.resize_(real_a_cpu.size()).copy_(real_a_cpu)
             real_b.data.resize_(real_b_cpu.size()).copy_(real_b_cpu)
             M.data.resize_(M_cpu.size()).copy_(M_cpu)
-            att, fake_b = gen.forward(real_a)
+
+            with torch.no_grad():  # No gradients needed here
+                att, fake_b = gen.forward(real_a)
 
             ################
             ### Update D ###
@@ -102,21 +125,20 @@ def train(config):
             
             opt_dis.zero_grad()
 
-            # train with fake
+            # Train with fake
             fake_ab = torch.cat((real_a, fake_b), 1)
             pred_fake = dis.forward(fake_ab.detach())
             batchsize, _, w, h = pred_fake.size()
 
             loss_d_fake = torch.sum(criterionSoftplus(pred_fake)) / batchsize / w / h
 
-            # train with real
+            # Train with real
             real_ab = torch.cat((real_a, real_b), 1)
             pred_real = dis.forward(real_ab)
             loss_d_real = torch.sum(criterionSoftplus(-pred_real)) / batchsize / w / h
 
             # Combined loss
             loss_d = loss_d_fake + loss_d_real
-
             loss_d.backward()
 
             if epoch % config.minimax == 0:
@@ -135,17 +157,21 @@ def train(config):
 
             # Second, G(A) = B
             loss_g_l1 = criterionL1(fake_b, real_b) * config.lamb
-            loss_g_att = criterionMSE(att[:,0,:,:], M)
+            loss_g_att = criterionMSE(att[:, 0, :, :], M)
             loss_g = loss_g_gan + loss_g_l1 + loss_g_att
 
+            # Accumulate gradients for G
             loss_g.backward()
 
-            opt_gen.step()
+            # Only update weights after a certain number of iterations
+            if iteration % accumulation_steps == 0:
+                opt_gen.step()
+                opt_gen.zero_grad()
 
-            # log
+            # Log
             if iteration % 10 == 0:
                 print("===> Epoch[{}]({}/{}): loss_d_fake: {:.4f} loss_d_real: {:.4f} loss_g_gan: {:.4f} loss_g_l1: {:.4f}".format(
-                epoch, iteration, len(training_data_loader), loss_d_fake.item(), loss_d_real.item(), loss_g_gan.item(), loss_g_l1.item()))
+                    epoch, iteration, len(training_data_loader), loss_d_fake.item(), loss_d_real.item(), loss_g_gan.item(), loss_g_l1.item()))
                 
                 log = {}
                 log['epoch'] = epoch
@@ -156,15 +182,28 @@ def train(config):
                 logreport(log)
 
         print('epoch', epoch, 'finished, use time', time.time() - epoch_start_time)
+
         with torch.no_grad():
             log_validation = test(config, validation_data_loader, gen, criterionMSE, epoch)
             validationreport(log_validation)
+
         print('validation finished')
+
+        # Save a combined model (generator and discriminator) as a single .pth file
         if epoch % config.snapshot_interval == 0:
-            checkpoint(config, epoch, gen, dis)
+            model_path = os.path.join(config.out_dir, f'combined_model_epoch_{epoch}.pth')
+            torch.save({
+                'epoch': epoch,
+                'gen_state_dict': gen.state_dict(),
+                'dis_state_dict': dis.state_dict(),
+                'opt_gen_state_dict': opt_gen.state_dict(),
+                'opt_dis_state_dict': opt_dis.state_dict(),
+            }, model_path)
+            print(f'Model saved to {model_path}')
 
         logreport.save_lossgraph()
         validationreport.save_lossgraph()
+
     print('training time:', time.time() - start_time)
 
 
@@ -179,7 +218,7 @@ if __name__ == '__main__':
     os.makedirs(config.out_dir)
     print('Job number: {:04d}'.format(n_job))
 
-    # 保存本次训练时的配置
+    # Save this run's config
     shutil.copyfile('config.yml', os.path.join(config.out_dir, 'config.yml'))
 
     train(config)
