@@ -1,7 +1,7 @@
 <h1 align="center">Cloud and Fog removal System using GAN</h1>
 
 ## 📜 Description:
-Optimized ISRO's pre-existing computer vision models to remove clouds and fog from satellite images. Achieved 84% accuracy, enhancing image clarity. Configured and tested the system through Bhuvan during my internship at ISRO's NRSC, Hyderabad.
+Optimized ISRO's pre-existing computer vision models to remove clouds and fog from satellite images. Achieved 84% accuracy, enhancing image clarity.
 
 # Sample Demo:
 ## Demo 1:
